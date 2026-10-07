@@ -488,8 +488,7 @@ Planned milestones (not built): a calibration step in the pipeline, uplift model
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **51 passed, 3 skipped** (the skipped tests need the `boost` extra) | `pytest -q` |
-| Expected CI | 51 passed, 3 skipped in a clean venv with `.[dev]` only | `.github/workflows/ci.yml` |
+| Unit tests (CI installs only `.[dev]`) | **51 passed, 3 skipped** (the skipped tests need the `boost` extra) | `pytest -q` |
 | Synthetic demo, validation split | logreg ROC-AUC 0.817, PR-AUC 0.526. hgb 0.787, 0.490. stack 0.814, 0.521 | `churn-colony train` |
 | Synthetic demo, test split (logreg) | ROC-AUC 0.835 (95 % CI 0.804-0.863), PR-AUC 0.566, Brier 0.130, ECE 0.030, lift 3.00 | `churn-colony train` |
 | Synthetic demo, cost | Threshold 0.22, 42.3 % contacted, recall 0.809, profit 10,784 against 81 for "contact all" | `churn-colony train` |
