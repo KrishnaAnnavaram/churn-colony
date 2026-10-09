@@ -69,6 +69,7 @@ This README is the **one location that explains all of churn-colony**. It gives 
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one run](#42-the-life-cycle-of-one-run)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The column contract and the features](#5-the-column-contract-and-the-features)
 6. 🐜 [The ant colony selector](#6-the-ant-colony-selector)
 7. 🟣 [Models, resampling and tuning](#7-models-resampling-and-tuning)
@@ -137,6 +138,56 @@ flowchart LR
 | Model card | `src/churn_colony/report.py` | `model_card.md` from the run summary |
 | CLI | `src/churn_colony/cli.py` | The `churn-colony` command with 8 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry point"]
+        CLI["cli.py<br/>8 subcommands"]
+    end
+    subgraph DATAIN["Data in"]
+        CFG["config.py<br/>load_env_file, Settings"]
+        DATA["data.py<br/>load, split"]
+        SYN["synthetic.py<br/>generate"]
+        SCH["schema.py<br/>validate, split_xy"]
+    end
+    subgraph STEPS["Pipeline steps"]
+        MOD["models.py<br/>build_pipeline, make_estimator"]
+        FEAT["features.py<br/>TelcoFeatures, leakage_screen"]
+        SEL["selection.py<br/>AntColonySelector, make_selector"]
+        RES["resample.py<br/>ResampledClassifier"]
+    end
+    subgraph RUNS["Runs and results"]
+        EXP["experiment.py<br/>train, compare_selectors,<br/>evaluate, score"]
+        TUN["tuning.py<br/>nested_cv"]
+        MET["metrics.py<br/>check_scores, bootstrap_ci"]
+        COST["cost.py<br/>best_threshold"]
+        EXPL["explain.py<br/>explain_customer"]
+        REP["report.py<br/>model_card"]
+    end
+    CLI --> CFG
+    CLI --> DATA
+    CLI --> SYN
+    CLI --> SCH
+    CLI --> EXP
+    CLI --> TUN
+    CLI --> EXPL
+    CLI --> REP
+    DATA --> SYN
+    DATA --> SCH
+    EXP --> DATA
+    EXP --> MOD
+    EXP --> FEAT
+    EXP --> MET
+    EXP --> COST
+    EXP --> EXPL
+    TUN --> MOD
+    MOD --> FEAT
+    MOD --> SEL
+    MOD --> RES
+    COST --> MET
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -180,11 +231,28 @@ churn-colony/
 ### 3.2 Every fitted step is in one pipeline
 The pipeline holds the features, the preprocessor, the selector and the model. Cross-validation, the search and `train` fit the whole pipeline on training rows only. Thus the scaler, the high-value limit and the selected columns never see validation or test rows.
 
+The diagram shows the steps of the pipeline, and which rows each part sees.
+
+```mermaid
+flowchart LR
+    TR[/"Training rows"/] --> FIT["Pipeline.fit"]
+    subgraph PIPE["build_pipeline"]
+        F["features:<br/>TelcoFeatures"] --> P["prep: impute, scale,<br/>one-hot"]
+        P --> S["select: none, l1,<br/>rfe or aco"]
+        S --> M["model: ResampledClassifier,<br/>SMOTE in fit only"]
+    end
+    FIT --> F
+    M --> FITTED["Fitted pipeline"]
+    VA[/"Validation or test rows"/] --> PP["predict_proba only"]
+    FITTED --> PP
+    PP --> SC[/"Churn scores"/]
+```
+
 ### 3.3 Class balance happens inside fit
 `ResampledClassifier` adds SMOTE rows when it fits, and it predicts on the real rows. In a search, each validation fold therefore has only real customers.
 
 ### 3.4 Metrics use probabilities
-`check_scores` refuses scores that are all 0 or 1 with `HardLabelsError`. ROC-AUC and PR-AUC always use `predict_proba`.
+`check_scores` refuses more than 10 scores that are all 0 or 1 with `HardLabelsError`. ROC-AUC and PR-AUC always use `predict_proba`.
 
 ### 3.5 The test split is used once
 `train` picks the model and the threshold on the validation split. Then it scores the test split one time and writes the result to the model card.
@@ -213,20 +281,63 @@ The split, the ants, the inner folds, SMOTE and each model get the seed from `--
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    CSV["CSV or synthetic rows"] --> VAL["validate: column contract"]
-    VAL --> SPL["split: train 60 %, validation 20 %, test 20 %"]
-    SPL --> LS["leakage screen on train features"]
-    LS -- "leak found" --> STOP["LeakageError: run stops"]
+flowchart TD
+    SRC{"--data or<br/>CHURN_COLONY_DATA set?"} -- "yes" --> CSV[/"Customer CSV,<br/>read as text"/]
+    SRC -- "no" --> SYN["synthetic.generate:<br/>5,000 rows"]
+    CSV --> VAL{"validate:<br/>column contract"}
+    SYN --> VAL
+    VAL -- "break" --> SE[/"SchemaError:<br/>error: and exit 1"/]
+    VAL -- "pass" --> SPL["split: train 60 %,<br/>validation 20 %, test 20 %"]
+    SPL --> LS{"leakage screen<br/>on train features"}
+    LS -- "leak found" --> STOP[/"LeakageError: run stops"/]
     LS -- "no leak" --> FIT["fit each candidate pipeline on train"]
     FIT --> PICK["keep the best validation PR-AUC"]
     PICK --> TH["threshold with the highest validation profit"]
     TH --> TEST["score test split once"]
-    TEST --> CARD["model card, metrics.json, model.joblib"]
-    CARD --> SCORE["score new customers, explain one customer"]
+    TEST --> RUN[("runs/name/<br/>model.joblib, metrics.json, model_card.md")]
+    NEW[/"New customer CSV,<br/>no Churn column needed"/] --> SCORE["score new customers"]
+    RUN --> SCORE
+    RUN --> EXPL["explain one customer by ID"]
+    SCORE --> LIST[/"Contact list:<br/>customerID, churn_score, contact"/]
+    LIST --> HUM{{"HUMAN<br/>reviews the contact list<br/>before a campaign"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUM human
 ```
 
 ### 4.2 The life cycle of one run
+
+```mermaid
+stateDiagram-v2
+    state "Settings loaded" as Settings
+    state "Raw table, all text" as Raw
+    state "Clean table" as Clean
+    state "Three splits" as Splits
+    state "Screened, no leak" as Screened
+    state "Candidates fitted" as Fitted
+    state "Model chosen" as Chosen
+    state "Threshold set" as Threshold
+    state "Test scored once" as Tested
+    state "Run folder saved" as Saved
+    state "error: message, exit 1" as Failed
+    state "LeakageError" as Leak
+    [*] --> Settings: load_env_file, Settings.from_env
+    Settings --> Failed: a setting is not valid
+    Settings --> Raw: read_csv or synthetic.generate
+    Raw --> Clean: validate
+    Raw --> Failed: SchemaError
+    Clean --> Splits: split with the seed
+    Splits --> Screened: leakage_screen finds no leak
+    Splits --> Leak: one column with AUC 0.95 or more
+    Screened --> Fitted: fit each candidate on train
+    Fitted --> Chosen: highest validation PR-AUC
+    Chosen --> Threshold: best_threshold on validation
+    Threshold --> Tested: metrics, intervals, calibration, profit
+    Tested --> Saved: save_run
+    Saved --> [*]
+    Failed --> [*]
+    Leak --> [*]
+```
 
 1. The CLI reads `.env` and the environment variables.
 2. `load` reads the CSV as text, or it generates synthetic rows.
@@ -239,11 +350,63 @@ flowchart TB
 9. `train` scores the test split one time.
 10. `save_run` writes `model.joblib`, `metrics.json` and `model_card.md`.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Analyst
+    participant CLI as cli.py
+    participant CFG as config.py
+    participant DATA as data.load
+    participant SCH as schema.validate
+    participant EXP as experiment.train
+    participant PIPE as Pipeline
+    participant COST as cost.py
+    participant REP as report.model_card
+    participant FS as Run folder
+
+    A->>CLI: churn-colony train --data file.csv
+    CLI->>CFG: load_env_file, Settings.from_env
+    CLI->>DATA: load(path, seed, rows)
+    DATA->>SCH: validate(raw)
+    SCH-->>DATA: clean table, ValidationReport
+    DATA-->>CLI: clean table, report, source
+    CLI->>EXP: train(df, models, selector, resampling, seed, cost)
+    EXP->>EXP: split, leakage_screen on the train features
+    loop each candidate model
+        EXP->>PIPE: build_pipeline, then fit(train)
+        PIPE-->>EXP: validation churn scores
+    end
+    EXP->>EXP: keep the best validation PR-AUC
+    EXP->>COST: best_threshold on validation
+    COST-->>EXP: threshold, validation profit
+    EXP->>PIPE: predict_proba(test), one time
+    EXP-->>CLI: summary and bundle
+    CLI->>REP: model_card(summary, source)
+    CLI->>FS: save_run: model.joblib, metrics.json, model_card.md
+    CLI-->>A: chosen model, threshold, test metrics
+```
+
 ---
 
 ## 5. The column contract and the features
 
 **Purpose.** Refuse a bad customer table early, and add features that are known at prediction time.
+
+The first diagram shows how `data.load` and `data.split` get the three splits.
+
+```mermaid
+flowchart LR
+    P{"path"} -- "CSV path" --> RC["read_csv:<br/>all columns as text"]
+    P -- "none" --> GEN["synthetic.generate:<br/>known logistic churn model"]
+    RC --> VAL["validate"]
+    GEN --> VAL
+    VAL --> SPL["split: stratified on Churn,<br/>test 20 %, then validation 20 %"]
+    SPL --> IDS{"A customerID<br/>in two splits?"}
+    IDS -- "yes" --> AE[/"AssertionError"/]
+    IDS -- "no" --> OUT[/"Splits: train 60 %,<br/>val 20 %, test 20 %"/]
+```
 
 | Input | Output |
 |---|---|
@@ -259,6 +422,29 @@ flowchart TB
 6. Refuse a row whose add-on columns disagree with `InternetService` or `PhoneService`.
 7. Change `Churn` to 1 for `Yes` and 0 for `No`. Refuse a table with one class.
 
+The second diagram shows the checks of `validate`.
+
+```mermaid
+flowchart TD
+    IN[/"Raw table as text"/] --> COLS{"All 21 columns present?"}
+    COLS -- "no" --> SE[/"SchemaError"/]
+    COLS -- "yes" --> ID{"customerID empty<br/>or repeated?"}
+    ID -- "yes" --> SE
+    ID -- "no" --> CAT{"Text value outside<br/>the allowed list?"}
+    CAT -- "yes" --> SE
+    CAT -- "no" --> TC["TotalCharges blank and tenure 0:<br/>use 0.0, record the fix"]
+    TC --> NUM{"Other blank, non-numeric<br/>or out-of-range value?"}
+    NUM -- "yes" --> SE
+    NUM -- "no" --> CONS{"Add-on columns disagree with<br/>InternetService or PhoneService?"}
+    CONS -- "yes" --> SE
+    CONS -- "no" --> CH{"Churn only<br/>Yes or No?"}
+    CH -- "no" --> SE
+    CH -- "yes" --> MAP["Churn: Yes to 1, No to 0"]
+    MAP --> ONE{"Only one class?"}
+    ONE -- "yes" --> SE
+    ONE -- "no" --> OUT[/"Typed table and ValidationReport"/]
+```
+
 **Engineered features** (`TelcoFeatures`)
 
 | Feature | Rule | Fitted? |
@@ -273,6 +459,20 @@ flowchart TB
 | `fiber_no_support` | Fiber optic internet and no tech support | No |
 | `tenure_band` | `0-12`, `13-24`, `25-48`, `49+` months | No |
 
+The third diagram shows how `TelcoFeatures` and the leakage screen work on the training rows.
+
+```mermaid
+flowchart LR
+    X[/"Raw feature columns"/] --> CHK{"Churn column<br/>in the frame?"}
+    CHK -- "yes" --> TIF[/"TargetInFeatures"/]
+    CHK -- "no" --> FIT["fit: 75th percentile of<br/>MonthlyCharges, training rows"]
+    FIT --> TR["transform: 9 engineered<br/>features for each row"]
+    TR --> SFA["single_feature_auc: each column alone,<br/>text by the churn rate of its level"]
+    SFA --> LK{"max of AUC and 1 − AUC<br/>0.95 or more?"}
+    LK -- "yes" --> LE[/"LeakageError: run stops"/]
+    LK -- "no" --> OK[/"Run continues"/]
+```
+
 **Rules**
 
 - The leakage screen scores each column alone. A text column gets the churn rate of its level.
@@ -285,6 +485,25 @@ flowchart TB
 ## 6. The ant colony selector
 
 **Purpose.** Find a small subset of encoded columns that keeps the cross-validated score.
+
+```mermaid
+flowchart TD
+    IN[/"Encoded training columns, target"/] --> TAU["Pheromone 0.5<br/>for each column"]
+    TAU --> IT["Next iteration"]
+    IT --> ANT["Ant: column j in the mask with a chance<br/>equal to its pheromone, clipped 0.05 to 0.95"]
+    ANT --> MIN{"Fewer than<br/>min_features columns?"}
+    MIN -- "yes" --> ADD["Add the columns with<br/>the highest pheromone"]
+    MIN -- "no" --> CV["Score: 3-fold stratified CV,<br/>ROC-AUC, cached for each mask"]
+    ADD --> CV
+    CV --> FITN["subset_fitness: score −<br/>size_penalty × selected share"]
+    FITN --> BEST["Update the iteration-best<br/>and the global-best masks"]
+    BEST --> MORE{"All n_ants done?"}
+    MORE -- "no" --> ANT
+    MORE -- "yes" --> UPD["Pheromone × 1 − evaporation,<br/>+ evaporation × mean of the 2 best masks"]
+    UPD --> LAST{"n_iterations done?"}
+    LAST -- "no" --> IT
+    LAST -- "yes" --> OUT[/"support_ = global-best mask,<br/>best_score_, history_"/]
+```
 
 | Input | Output |
 |---|---|
@@ -317,11 +536,40 @@ flowchart TB
 - The selector is a pipeline step. In `churn-colony select`, it runs inside each outer fold.
 - The global-best fitness never decreases from one iteration to the next.
 
+The diagram shows how `churn-colony select` (`compare_selectors`) compares the four selectors.
+
+```mermaid
+flowchart LR
+    DF[/"Clean table"/] --> SPL["split, then join train and validation.<br/>The test split is not used"]
+    SPL --> CV["StratifiedKFold:<br/>5 folds"]
+    CV --> SEL["make_selector for each name:<br/>none: passthrough<br/>l1: L1 logistic, C 0.05<br/>rfe: RFE to half the columns<br/>aco: AntColonySelector"]
+    SEL --> PIPE["cross_validate the full pipeline:<br/>selection fits inside each fold"]
+    PIPE --> RES[/"roc_auc_mean, roc_auc_std,<br/>pr_auc_mean, columns_mean, seconds"/]
+```
+
 ---
 
 ## 7. Models, resampling and tuning
 
 **Purpose.** Compare a simple baseline with stronger models on the same pipeline.
+
+The first diagram shows how `build_pipeline` makes the model step.
+
+```mermaid
+flowchart LR
+    IN[/"model, selector,<br/>resampling, seed"/] --> RS{"resampling"}
+    RS -- "class_weight" --> BAL["make_estimator,<br/>balanced"]
+    RS -- "none, smote, random" --> EST["make_estimator,<br/>not balanced"]
+    BAL --> NAME{"model name"}
+    EST --> NAME
+    NAME -- "logreg, rf, hgb, stack" --> CORE["scikit-learn model"]
+    NAME -- "lightgbm, xgboost, catboost" --> EXTRA{"Extra boost<br/>installed?"}
+    EXTRA -- "no" --> ME[/"MissingExtra"/]
+    EXTRA -- "yes" --> BOOST["Boosted model"]
+    CORE --> WRAP["ResampledClassifier:<br/>method smote, random or none"]
+    BOOST --> WRAP
+    WRAP --> PIPE[/"Pipeline: features, prep,<br/>select, model"/]
+```
 
 | Model | Class | Notes |
 |---|---|---|
@@ -338,12 +586,42 @@ flowchart TB
 | `smote` | SMOTE rows between minority neighbours (k = 5), in `fit` only |
 | `random` | Copies of random minority rows, in `fit` only |
 
+The second diagram shows how `ResampledClassifier` balances the classes in `fit` and predicts on the real rows.
+
+```mermaid
+flowchart TD
+    FIT[/"fit: X, y"/] --> M{"method"}
+    M -- "smote" --> SM["smote: k = 5 minority neighbours,<br/>new rows on the lines between them"]
+    M -- "random" --> RO["random_oversample:<br/>copies of minority rows"]
+    M -- "none" --> NO["No change"]
+    SM --> EQ["Both classes have<br/>the same count"]
+    RO --> EQ
+    EQ --> EF["Clone the estimator, fit"]
+    NO --> EF
+    PRED[/"predict_proba: X"/] --> RP["estimator_.predict_proba<br/>on the given rows, no new rows"]
+    EF --> RP
+```
+
 **Procedure (tune)**
 
 1. Split the rows into 5 outer stratified folds.
 2. In each outer training part, run `RandomizedSearchCV` on the whole pipeline: 10 settings, 3 inner folds, ROC-AUC.
 3. Score the best inner pipeline on the outer test fold with probabilities.
 4. Report the mean and the standard deviation of the outer scores and the best settings of each fold.
+
+```mermaid
+flowchart TD
+    IN[/"Clean table: X, y,<br/>model with a search space"/] --> SP{"Model in<br/>PARAM_SPACES?"}
+    SP -- "no, for example stack" --> VE[/"ValueError"/]
+    SP -- "yes" --> OUT5["StratifiedKFold:<br/>5 outer folds"]
+    OUT5 --> SR["Outer training part:<br/>RandomizedSearchCV on the whole pipeline"]
+    SR --> INNER["10 settings, 3 inner folds,<br/>ROC-AUC"]
+    INNER --> REFIT["Refit the best setting<br/>on the outer training part"]
+    REFIT --> SCORE["predict_proba on the outer test fold:<br/>ROC-AUC, PR-AUC"]
+    SCORE --> NEXT{"More outer folds?"}
+    NEXT -- "yes, seed + fold number" --> SR
+    NEXT -- "no" --> RES[/"roc_auc_mean, roc_auc_std, pr_auc_mean,<br/>best_params of each fold"/]
+```
 
 **Rules**
 
@@ -365,6 +643,25 @@ flowchart TB
 | Precision, recall, F1, accuracy and confusion counts | At the threshold and at 0.5 |
 | Permutation importance of each raw column (ROC-AUC drop, 5 repeats) | Test split |
 
+The diagram shows how `train` scores the test split one time.
+
+```mermaid
+flowchart LR
+    P[/"Test churn scores<br/>from predict_proba"/] --> CS{"check_scores:<br/>more than 10 scores,<br/>all 0 or 1?"}
+    CS -- "yes" --> HL[/"HardLabelsError"/]
+    CS -- "no" --> PM["probability_metrics:<br/>ROC-AUC, PR-AUC, Brier, log loss"]
+    PM --> BS["bootstrap_ci: 500 resamples,<br/>ROC-AUC and PR-AUC"]
+    PM --> CAL["calibration_table:<br/>10 bins, ECE"]
+    PM --> LIFT["lift_at: top 10 %"]
+    PM --> THM["threshold_metrics:<br/>at the threshold and at 0.5"]
+    PM --> PI["permutation_importance_raw:<br/>ROC-AUC drop, 5 repeats"]
+    BS --> SUM[/"summary: test block<br/>of metrics.json"/]
+    CAL --> SUM
+    LIFT --> SUM
+    THM --> SUM
+    PI --> SUM
+```
+
 **Cost model.** For each customer on the contact list, the campaign pays the contact cost.
 If the customer is a churner, the offer keeps the customer with the offer success rate.
 A kept customer saves `MonthlyCharges × value months`.
@@ -374,6 +671,19 @@ A kept customer saves `MonthlyCharges × value months`.
 | Contact cost | 25 | `CHURN_COLONY_CONTACT_COST` |
 | Offer success rate | 0.25 | `CHURN_COLONY_OFFER_SUCCESS` |
 | Value months | 6 | `CHURN_COLONY_VALUE_MONTHS` |
+
+The diagram shows how `best_threshold` picks the threshold on the validation split.
+
+```mermaid
+flowchart TD
+    IN[/"Validation churn scores,<br/>Churn, MonthlyCharges"/] --> VAL["value = MonthlyCharges<br/>× value months"]
+    VAL --> GRID["For each threshold t:<br/>0.02 to 0.98, step 0.01"]
+    GRID --> CON["Contact list:<br/>churn_score ≥ t"]
+    CON --> PROF["profit = sum of Churn × offer success × value,<br/>− contact cost × contacts"]
+    PROF --> BEST["Sort by profit, then by threshold,<br/>both from high to low"]
+    BEST --> OUT[/"Threshold with the highest profit.<br/>A tie goes to the higher threshold"/]
+    IN --> REF[/"Reference profits: contact nobody = 0,<br/>contact everybody"/]
+```
 
 **Decision rules**
 
@@ -388,6 +698,18 @@ A kept customer saves `MonthlyCharges × value months`.
 
 **Per-customer effects.** `explain_customer` puts each raw column to its training reference value (median or most frequent level).
 The effect is the churn score minus the new churn score. A positive effect means that the column increases the churn score of that customer.
+
+```mermaid
+flowchart LR
+    ID[/"--customer ID"/] --> ROW{"ID in the data?"}
+    ROW -- "no" --> KE[/"KeyError:<br/>error: and exit 1"/]
+    ROW -- "yes" --> BASE["Churn score of the row"]
+    BASE --> VAR["For each raw column: a copy of the row<br/>with the training reference value"]
+    REF[("model.joblib:<br/>reference values")] --> VAR
+    VAR --> SC["Churn score of each copy"]
+    SC --> EFF["effect = churn score<br/>− new churn score"]
+    EFF --> OUT[/"Columns sorted by absolute effect,<br/>top 8 by default"/]
+```
 
 ---
 
@@ -450,7 +772,28 @@ churn-colony train --data data/WA_Fn-UseC_-Telco-Customer-Churn.csv --out runs/t
 ```
 
 `python -m churn_colony` is the same as `churn-colony`.
-An error prints `error: <message>`, and the exit code is 1.
+A data, settings or file error prints `error: <message>`, and the exit code is 1.
+A `LeakageError` or a missing optional extra stops the command with a Python traceback.
+
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["churn-colony synth"]
+    SYN --> CSV[("data/synthetic_telco.csv")]
+    REAL[/"IBM Telco CSV<br/>local, not committed"/] --> VAL["churn-colony validate"]
+    CSV --> VAL
+    INS -- "no CSV: synthetic rows" --> TRN["churn-colony train"]
+    CSV -- "--data" --> TRN
+    REAL -- "--data" --> TRN
+    INS --> SEL["churn-colony select"]
+    INS --> TUN["churn-colony tune"]
+    TRN --> RUN[("runs/latest/<br/>model.joblib, metrics.json, model_card.md")]
+    RUN --> EVA["churn-colony evaluate"]
+    RUN --> EXP["churn-colony explain"]
+    RUN --> SCO["churn-colony score"]
+    SCO --> LIST[("contact_list.csv")]
+```
 
 ### 10.4 Environment variables
 
@@ -466,6 +809,18 @@ An error prints `error: <message>`, and the exit code is 1.
 
 The CLI reads `--env-file` (default `.env`) first. A variable that is already set is not replaced.
 The project needs no credentials.
+
+```mermaid
+flowchart LR
+    DOT[/".env file<br/>--env-file"/] --> LD["load_env_file:<br/>sets only absent variables"]
+    PENV[/"Process environment"/] --> FE["Settings.from_env"]
+    LD --> FE
+    FE --> CHK{"Settings.check: cost, success rate,<br/>value months, threads valid?"}
+    CHK -- "no" --> ERR[/"error: and exit 1"/]
+    CHK -- "yes" --> TP["threadpool_limits:<br/>CHURN_COLONY_THREADS"]
+    TP --> RUN["Run the subcommand"]
+    FLAG[/"--data, --seed"/] -- "a given flag wins" --> RUN
+```
 
 ---
 
